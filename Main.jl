@@ -1,4 +1,11 @@
-# Hello
+"""
+    Water-Melt-PT
+
+A Julia package for modeling water release and melt production during 
+metamorphism using MAGEMin thermodynamic calculations.
+
+
+"""
 
 using Reexport: @reexport
 @reexport using MAGEMin_C
@@ -20,11 +27,11 @@ g_factor = 1.0
 Tmin = 600.0
 Tmax = 750.0
 T_array = collect(Tmin:1.0:Tmax)
-Pmin = 5.0
-Pmax = 15.0
+Pmin = 14.0
+Pmax = 9.5
 P_resolution = (Pmax - Pmin) / (length(T_array) - 1)
 if P_resolution == 0.0
-    P_resolution = Pmin * (ones(length(T_array)))
+    P_array = Pmin * (ones(length(T_array)))
 else
     P_array = collect(Pmin:P_resolution:Pmax)
 end
@@ -86,9 +93,9 @@ out_mg = Vector{MAGEMin_C.gmin_struct{Float64,Int64}}(undef, length(P_array))
 out_og = Vector{MAGEMin_C.gmin_struct{Float64,Int64}}(undef, length(P_array))
 
 # Create variables to store results
-T_mp_solidus = T_init
-T_mg_solidus = T_init
-T_og_solidus = T_init
+# T_mp_solidus = Tmin
+# T_mg_solidus = Tmin
+# T_og_solidus = Tmin
 g_frac_mp = zeros(length(P_array))
 g_frac_mg = zeros(length(P_array))
 g_frac_og = zeros(length(P_array))
@@ -212,17 +219,21 @@ effective_fractions_og_vol = zeros(length(P_array))
         g_frac_og_vol[step] = 0.0
     end
 
-    # search for the solidus
-    if !in("liq", out_mp[step].ph)
-        T_mp_solidus = T
-    end
-    if !in("liq", out_mg[step].ph)
-        T_mg_solidus = T
-    end
-    if !in("liq", out_og[step].ph)
-        T_og_solidus = T
-    end
+    # # search for the solidus
+    # if !in("liq", out_mp[step].ph)
+    #     T_mp_solidus = T
+    # end
+    # if !in("liq", out_mg[step].ph)
+    #     T_mg_solidus = T
+    # end
+    # if !in("liq", out_og[step].ph)
+    #     T_og_solidus = T
+    # end
 end
+
+T_mp_solidus = findfirst(x -> in("liq", out_mp[x].ph), eachindex(T_array)) + Tmin
+T_mg_solidus = findfirst(x -> in("liq", out_mg[x].ph), eachindex(T_array)) + Tmin
+T_og_solidus = findfirst(x -> in("liq", out_og[x].ph), eachindex(T_array)) + Tmin
 
 # calculate the effective fractions at each step
 effect_fract_mp_total = accumulate(*, effective_fractions_mp)
@@ -272,8 +283,8 @@ H2O_frac_mg_total_vol_cum = accumulate(+, H2O_frac_mg_total_vol)
 H2O_frac_og_total_vol_cum = accumulate(+, H2O_frac_og_total_vol)
 
 # Calculate the amount of water released between the two solidi
-H2O_mp_melt_og = H2O_frac_mp_total_cum[Int(T_mp_solidus-T_init)] - H2O_frac_mp_total_cum[Int(T_og_solidus-T_init)]
-H2O_mg_melt_og = H2O_frac_mg_total_cum[Int(T_mg_solidus-T_init)] - H2O_frac_mg_total_cum[Int(T_og_solidus-T_init)]
+H2O_mp_melt_og = H2O_frac_mp_total_cum[Int(T_mp_solidus-Tmin)] - H2O_frac_mp_total_cum[Int(T_og_solidus-Tmin)]
+H2O_mg_melt_og = H2O_frac_mg_total_cum[Int(T_mg_solidus-Tmin)] - H2O_frac_mg_total_cum[Int(T_og_solidus-Tmin)]
 
 # Print results
 println("H2O released mp: $(H2O_mp_melt_og*100)")
@@ -284,11 +295,11 @@ println("$T_og_solidus °C orthogneiss solidus temperature")
 
 # Calculation of the volume of melt created with the water-influx
 # Extract excess water at the solidus point
-out_og_melt_init = single_point_minimization(P_array[1], T_array[1], data, X=X_init_og, Xoxides=Xoxides, name_solvus= true, sys_in=sys_in);
+out_og_melTmin = single_point_minimization(P_array[1], T_array[1], data, X=X_init_og, Xoxides=Xoxides, name_solvus= true, sys_in=sys_in);
 X_og_melt = copy(X_init_og)
-if "H2O" in out_og_melt_init.ph
-    local H2O_index = findfirst(==("H2O"), out_og_melt_init.ph)
-    X_og_melt = X_init_og .- ((H2O_comp) .* out_og_melt_init.ph_frac[H2O_index])
+if "H2O" in out_og_melTmin.ph
+    local H2O_index = findfirst(==("H2O"), out_og_melTmin.ph)
+    X_og_melt = X_init_og .- ((H2O_comp) .* out_og_melTmin.ph_frac[H2O_index])
 end
 X_og_melt = X_og_melt ./ sum(X_og_melt)
 X_og_mp_melt = copy(X_og_melt)
@@ -360,7 +371,7 @@ out_og_mg_melt = Vector{MAGEMin_C.gmin_struct{Float64, Int64}}(undef, length(P_a
     end
 
     # extract water-excess
-    if "H2O" in out_og_mp_melt[step].ph && step < (T_og_solidus - T_init)
+    if "H2O" in out_og_mp_melt[step].ph && step < (T_og_solidus - Tmin)
         local H2O_index = findfirst(==("H2O"), out_og_mp_melt[step].ph)
         H2O_frac_og_mp_melt[step] = out_og_mp_melt[step].ph_frac[H2O_index] 
         H2O_frac_og_mp_melt_vol[step] = out_og_mp_melt[step].ph_frac_vol[H2O_index]
@@ -428,7 +439,7 @@ H2O_frac_og_mp_melt_total_vol_cum = accumulate(+, H2O_frac_og_mp_melt_total_vol)
     end
 
     # extract water-excess
-    if "H2O" in out_og_mg_melt[step].ph && step < (T_og_solidus - T_init)
+    if "H2O" in out_og_mg_melt[step].ph && step < (T_og_solidus - Tmin)
         local H2O_index = findfirst(==("H2O"), out_og_mg_melt[step].ph)
         H2O_frac_og_mg_melt[step] = out_og_mg_melt[step].ph_frac[H2O_index]
         H2O_frac_og_mg_melt_vol[step] = out_og_mg_melt[step].ph_frac_vol[H2O_index]
@@ -481,7 +492,15 @@ println("T og+mg melt = $(T_array[idx_mg_exceeds]) °C")
 println("melt_fraction_og_mp = $(Melt_frac_og_mp_melt_total_vol_cum[idx_mp_exceeds]*100)")
 println("melt_fraction_og_mg = $(Melt_frac_og_mg_melt_total_vol_cum[idx_mg_exceeds]*100)")
 
+println("melt composition og+mp at T_mp = $(T_array[idx_mp_exceeds]) °C = $(out_og_mp_melt[idx_mp_exceeds].SS_vec[findfirst(==("liq"), out_og_mp_melt[idx_mp_exceeds].ph)].Comp)")
+println("melt composition og+mg at T_mg = $(T_array[idx_mg_exceeds]) °C = $(out_og_mg_melt[idx_mg_exceeds].SS_vec[findfirst(==("liq"), out_og_mg_melt[idx_mg_exceeds].ph)].Comp)")
+println("melt composition mp at T = $(T_array[idx_mp_exceeds]) °C = $(out_mp[idx_mp_exceeds].SS_vec[findfirst(==("liq"), out_mp[idx_mp_exceeds].ph)].Comp)")
+println("melt composition mg at T = $(T_array[idx_mg_exceeds]) °C = $(out_mg[idx_mg_exceeds].SS_vec[findfirst(==("liq"), out_mg[idx_mg_exceeds].ph)].Comp)")
 
+println("melt composition og+mp at T = $(Int(T_mp_solidus-Tmin)) °C = $(out_og_mp_melt[Int(T_mp_solidus-Tmin)].SS_vec[findfirst(==("liq"), out_og_mp_melt[Int(T_mp_solidus-Tmin)].ph)].Comp)")
+println("melt composition og+mg at T = $(Int(T_mg_solidus-Tmin)) °C = $(out_og_mg_melt[Int(T_mg_solidus-Tmin)].SS_vec[findfirst(==("liq"), out_og_mg_melt[Int(T_mg_solidus-Tmin)].ph)].Comp)")
+println("melt composition og at T = $(Int(T_mp_solidus-Tmin)) °C = $(out_og[Int(T_mp_solidus-Tmin)].SS_vec[findfirst(==("liq"), out_og[Int(T_mp_solidus-Tmin)].ph)].Comp)")
+println("melt composition og at T = $(Int(T_mg_solidus-Tmin)) °C = $(out_og[Int(T_mg_solidus-Tmin)].SS_vec[findfirst(==("liq"), out_og[Int(T_mg_solidus-Tmin)].ph)].Comp)")
 
 # Plot the results
 
