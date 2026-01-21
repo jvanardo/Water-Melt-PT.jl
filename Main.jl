@@ -516,7 +516,7 @@ vlines!(ax, T_mp_solidus, linestyle=:dash, color=:black, linewidth=1.5, label="T
 vlines!(ax, T_mg_solidus, linestyle=:dash, color=:blue, linewidth=1.5, label="T solidus MG")
 vlines!(ax, T_og_solidus, linestyle=:dash, color=:red, linewidth=1.5, label="T solidus OG")
 # Add text annotations with the water values
-text!(ax, T_og_solidus + 5, 0.045, text="H₂O MP = $(round(H2O_mp_melt_og, digits=4))\nH₂O MG = $(round(H2O_mg_melt_og, digits=4))\nH₂O Total = $(round(H2O_total_melt_og, digits=4))", 
+text!(ax, T_og_solidus + 5, 0.045, text="H₂O MP = $(round(H2O_mp_melt_og, digits=4))\nH₂O MG = $(round(H2O_mg_melt_og, digits=4))", 
         fontsize=12, align=(:left, :top))
 axislegend(ax, position=:lt)
 display(fig1)  # Display the plot
@@ -792,8 +792,8 @@ Legend(fig3[1:2, 3], legend_elements, legend_labels, framevisible=true)
 
 display(fig3)
 
-save("H2O_frac_PT$(i).svg", fig1)
-save("Liq_frac_PT$(i).svg",  fig2)
-save("Mode_Boxes_4Panel_PT$(i).svg", fig3)
+save("H2O_frac.svg", fig1)
+save("Liq_frac.svg",  fig2)
+save("Mode_Boxes.svg", fig3)
 
 Finalize_MAGEMin(data)
