@@ -1,886 +1,497 @@
 """
     WaterMeltPT
 
-A Julia package for modeling water release and melt production during 
+A Julia package for modeling water release and melt production during
 metamorphism using MAGEMin thermodynamic calculations.
 
-This package simulates path-dependent multi-system phase diagram modeling 
+This package simulates path-dependent multi-system phase diagram modeling
 to calculate water-present partial melting reactions in a heterogeneous crust.
 
 # Main Features
 - Calculate water release along P-T paths for multiple lithologies
-- Model garnet fractionation during metamorphism  
+- Model garnet fractionation during metamorphism
 - Simulate water-fluxed melting in orthogneiss
 - Generate mode box diagrams and melt fraction plots
 
 # References
 - Forshaw, J.B. and Pattison, D.R.M. (2024) - Metapelite bulk compositions
-- Villaros, A. et al. (2018) - Metagraywacke bulk compositions
+- Vielzeuf & Montel (1994)  - Metagraywacke bulk compositions
 - Weisbrod, A. (1970) - Orthogneiss bulk compositions
 - Lanari, P. and Tedeschi, M. (2024) - Phase color conventions
 
-# Example
-```julia
-using WaterMeltPT
-
-# Define configuration
-config = PTPathConfig(
-    Tmin = 600.0, Tmax = 750.0,
-    Pmin = 14.0, Pmax = 9.5,
-    g_factor = 1.0
-)
-
-# Run simulation
-results = run_water_melt_simulation(config)
-```
 """
 module WaterMeltPT
 
-using Reexport: @reexport
+using Reexport
 @reexport using MAGEMin_C
 using CSV
 using DataFrames
 using ProgressMeter
-using CairoMakie
+@reexport using CairoMakie
 
-export PTPathConfig, BulkComposition, SimulationResults
-export run_water_melt_simulation, plot_results, save_results
-export extract_water_excess!, fractionate_garnet!, find_solidus_temperature
+export prepare_bulk_composition, define_PT_path, extract_init_H2O
+export run_PT_path, calculate_additional_H2O, calculate_effect_frac, calculate_melt_frac
+export extract_H2O_PT, fractionate_Grt
+export plot_fig_pl, plot_fig_melt_comp, plot_fig1, plot_fig2, plot_fig3, collect_phases, ax_boxplot
 
-# ============================================================================
-# Constants
-# ============================================================================
-
-"""Default oxide components for MAGEMin metapelite database."""
-const XOXIDES = ["SiO2", "Al2O3", "CaO", "MgO", "FeO", "K2O", "Na2O", "TiO2", "O", "MnO", "H2O"]
-
-"""Input oxide components (with Fe2O3 separated)."""
-const X_INIT_OX = ["SiO2", "Al2O3", "CaO", "MgO", "FeO", "Fe2O3", "K2O", "Na2O", "TiO2", "MnO", "H2O"]
-
-"""Pure H2O composition vector for water extraction calculations."""
-const H2O_COMP = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-
-"""
-Phase color map following Lanari and Tedeschi (2024) conventions.
-"""
-const PHASE_COLOR_MAP = Dict{String, Any}(
-    "liq"  => :red,
-    "pl"   => (0.925, 0.863, 0.620),
-    "q"    => (1.000, 1.000, 1.000),
-    "bi"   => (0.463, 0.224, 0.129),
-    "mu"   => (0.851, 0.780, 0.796),
-    "afs"  => (0.914, 0.722, 0.800),
-    "ilm"  => (0.878, 0.365, 0.165),
-    "sill" => (0.000, 0.561, 0.737),
-    "and"  => (0.498, 0.702, 0.757),
-    "ky"   => (0.000, 0.357, 0.576),
-    "crd"  => (0.533, 0.408, 0.659),
-    "zo"   => (0.733, 0.706, 0.216),
-    "H2O"  => :lightblue,
-    "g"    => (0.710, 0.173, 0.122),
-    "st"   => (0.886, 0.667, 0.000),
-    "ttn"  => (0.745, 0.541, 0.263),
-    "ru"   => (0.024, 0.259, 0.463),
-    "chl"  => (0.506, 0.753, 0.443),
-    "cld"  => (0.369, 0.467, 0.380),
-    "opx"  => (0.882, 0.486, 0.565),
-    "pat"  => (0.855, 0.514, 0.314)
-)
-
-# ============================================================================
-# Configuration Types
-# ============================================================================
-
-"""
-    PTPathConfig
-
-Configuration for P-T path simulation.
-
-# Fields
-- `Tmin::Float64`: Minimum temperature (°C)
-- `Tmax::Float64`: Maximum temperature (°C)  
-- `T_step::Float64`: Temperature step size (°C)
-- `Pmin::Float64`: Starting pressure (kbar)
-- `Pmax::Float64`: Ending pressure (kbar)
-- `g_factor::Float64`: Fraction of garnet to fractionate (0.0-1.0)
-- `sys_in::String`: Input system type ("mol" or "wt")
-"""
-Base.@kwdef struct PTPathConfig
-    Tmin::Float64 = 600.0
-    Tmax::Float64 = 750.0
-    T_step::Float64 = 1.0
-    Pmin::Float64 = 14.0
-    Pmax::Float64 = 9.5
-    g_factor::Float64 = 1.0
-    sys_in::String = "mol"
+function prepare_bulk_composition(X_init_wt, X_init_ox, P_array, T_array, data, sys_in;
+                                M_oxides = [60.08; 101.96; 56.08; 40.30; 71.85; 159.69; 94.20; 61.98; 79.87; 70.94; 18.02],
+                                H2O_comp = [0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 1.0])
+    X_init, ox = convertBulk4MAGEMin(X_init_wt, X_init_ox, "wt", "mp")
+    X_init = X_init ./ sum(X_init) # normalize to 1
+    out_init = single_point_minimization(P_array[1], T_array[1], data, X=X_init, Xoxides=ox, name_solvus=true, sys_in=sys_in)
+    X = extract_init_H2O(out_init, X_init)
+    X_wt = X .* M_oxides
+    X_wt = 100 * X_wt ./ sum(X_wt)
+    return X, X_wt
 end
 
-"""
-    BulkComposition
-
-Represents a bulk rock composition with metadata.
-
-# Fields
-- `name::String`: Name of the lithology
-- `composition_wt::Vector{Float64}`: Composition in weight percent
-- `reference::String`: Literature reference for the composition
-"""
-struct BulkComposition
-    name::String
-    composition_wt::Vector{Float64}
-    reference::String
-end
-
-"""
-    LithologyResults
-
-Results for a single lithology along the P-T path.
-
-# Fields
-- `name::String`: Lithology name
-- `out::Vector`: MAGEMin output structures
-- `g_frac::Vector{Float64}`: Garnet fractions at each step
-- `g_frac_total_cum::Vector{Float64}`: Cumulative garnet fraction
-- `H2O_frac::Vector{Float64}`: Water fractions at each step
-- `H2O_frac_total_cum::Vector{Float64}`: Cumulative water fraction
-- `melt_frac_total_vol_cum::Vector{Float64}`: Cumulative melt volume fraction
-- `T_solidus::Float64`: Solidus temperature
-"""
-mutable struct LithologyResults
-    name::String
-    out::Vector{MAGEMin_C.gmin_struct{Float64,Int64}}
-    X::Vector{Float64}
-    g_frac::Vector{Float64}
-    g_frac_vol::Vector{Float64}
-    g_frac_total::Vector{Float64}
-    g_frac_total_vol::Vector{Float64}
-    g_frac_total_cum::Vector{Float64}
-    g_frac_total_vol_cum::Vector{Float64}
-    H2O_frac::Vector{Float64}
-    H2O_frac_vol::Vector{Float64}
-    H2O_frac_total::Vector{Float64}
-    H2O_frac_total_vol::Vector{Float64}
-    H2O_frac_total_cum::Vector{Float64}
-    H2O_frac_total_vol_cum::Vector{Float64}
-    melt_frac_total_vol_cum::Vector{Float64}
-    effective_fractions::Vector{Float64}
-    effective_fractions_vol::Vector{Float64}
-    effect_fract_total::Vector{Float64}
-    effect_fract_total_vol::Vector{Float64}
-    T_solidus::Float64
-end
-
-"""
-    SimulationResults
-
-Complete results from a water-melt simulation.
-
-# Fields  
-- `config::PTPathConfig`: Configuration used
-- `T_array::Vector{Float64}`: Temperature array
-- `P_array::Vector{Float64}`: Pressure array
-- `lithologies::Dict{String, LithologyResults}`: Results by lithology name
-"""
-struct SimulationResults
-    config::PTPathConfig
-    T_array::Vector{Float64}
-    P_array::Vector{Float64}
-    lithologies::Dict{String, LithologyResults}
-end
-
-# ============================================================================
-# Default Compositions
-# ============================================================================
-
-"""
-    default_compositions()
-
-Returns default bulk compositions for metapelite, metagraywacke, and orthogneiss.
-
-# References
-- Metapelite: Forshaw and Pattison (2024)
-- Metagraywacke: Villaros et al. (2018)  
-- Orthogneiss: Weisbrod (1970)
-"""
-function default_compositions()
-    return Dict(
-        "metapelite" => BulkComposition(
-            "metapelite",
-            # SiO2, Al2O3, CaO, MgO, FeO, Fe2O3, K2O, Na2O, TiO2, MnO, H2O
-            [59.22, 18.12, 0.60, 2.22, 6.32, 0.0, 3.65, 1.27, 0.84, 0.0, 20.0],
-            "Forshaw and Pattison (2024)"
-        ),
-        "metagraywacke" => BulkComposition(
-            "metagraywacke", 
-            [70.48, 13.05, 1.68, 2.38, 4.86, 0.0, 2.43, 2.97, 0.70, 0.0, 20.0],
-            "Villaros et al. (2018)"
-        ),
-        "orthogneiss" => BulkComposition(
-            "orthogneiss",
-            [71.93, 14.91, 1.28, 0.79, 2.40, 0.0, 4.73, 2.95, 0.26, 0.0, 20.0],
-            "Weisbrod (1970)"
-        )
-    )
-end
-
-# ============================================================================
-# Helper Functions  
-# ============================================================================
-
-"""
-    create_pt_arrays(config::PTPathConfig)
-
-Create temperature and pressure arrays from configuration.
-
-# Arguments
-- `config::PTPathConfig`: P-T path configuration
-
-# Returns
-- `T_array::Vector{Float64}`: Temperature array
-- `P_array::Vector{Float64}`: Pressure array
-"""
-function create_pt_arrays(config::PTPathConfig)
-    T_array = collect(config.Tmin:config.T_step:config.Tmax)
-    n_steps = length(T_array)
-    
-    P_resolution = (config.Pmax - config.Pmin) / (n_steps - 1)
+function define_PT_path(Tmin, Tmax, Pmin, Pmax)
+    T_array = collect(Tmin:1.0:Tmax)
+    P_resolution = (Pmax - Pmin) / (length(T_array) - 1)
     if P_resolution == 0.0
-        P_array = fill(config.Pmin, n_steps)
+        P_array = Pmin * (ones(length(T_array)))
     else
-        P_array = collect(config.Pmin:P_resolution:config.Pmax)
+        P_array = collect(Pmin:P_resolution:Pmax)
     end
-    
     return T_array, P_array
 end
 
-"""
-    prepare_composition(comp::BulkComposition)
-
-Convert weight percent composition to normalized molar composition for MAGEMin.
-
-# Arguments
-- `comp::BulkComposition`: Bulk composition in weight percent
-
-# Returns
-- `X::Vector{Float64}`: Normalized molar composition
-"""
-function prepare_composition(comp::BulkComposition)
-    X, _ = convertBulk4MAGEMin(comp.composition_wt, X_INIT_OX, "wt", "mp")
-    return X ./ sum(X)
+function extract_init_H2O(out, X; H2O_comp = [0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 1.0])
+    if "H2O" in out.ph
+        local H2O_index = findfirst(==("H2O"), out.ph)
+        X .= X .- ((H2O_comp) .* out.ph_frac[H2O_index])
+        X = X ./ sum(X) # normalize to 1 after removing the excess water
+        return X  # remove only the excess
+    else
+        error("Initial composition  of $out must contain H2O to proceed with water-excess calculation.")
+    end
 end
 
-"""
-    extract_water_excess!(X::Vector{Float64}, out, H2O_comp::Vector{Float64})
+function run_PT_path(T_array, P_array, data, X, Xoxides, g_factor, sys_in, Tmin;
+    additional_H2O = zeros(length(T_array), 3),
+    H2O_comp = [0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 1.0])
 
-Remove excess free water from bulk composition based on minimization results.
+    out = Vector{MAGEMin_C.gmin_struct{Float64,Int64}}(undef, length(P_array))
+    # mol%, vol%, wt%
+    g_frac = zeros(length(P_array), 3)
+    g_frac_total = zeros(length(P_array), 3)
+    g_frac_total_cum = zeros(length(P_array), 3)
+    H2O_frac = zeros(length(P_array), 3)
+    H2O_frac_total = zeros(length(P_array), 3)
+    H2O_frac_total_cum = zeros(length(P_array), 3)
+    melt_frac = zeros(length(P_array), 3)
+    effect_frac = zeros(length(P_array), 3)
+    effect_frac_total = zeros(length(P_array), 3)
 
-# Arguments
-- `X::Vector{Float64}`: Bulk composition (modified in place)
-- `out`: MAGEMin output structure
-- `H2O_comp::Vector{Float64}`: Pure H2O composition vector
+    @showprogress for step in eachindex(T_array)
+        T = T_array[step]
+        P = P_array[step]
 
-# Returns
-- `H2O_frac::Float64`: Molar fraction of removed water
-- `H2O_frac_vol::Float64`: Volume fraction of removed water
-"""
-function extract_water_excess!(X::Vector{Float64}, out, H2O_comp::Vector{Float64})
+        if additional_H2O[step,1] !== 0.0
+            X .= X .+ (additional_H2O[step, 1] .* H2O_comp)
+        end
+
+        # Calculate the effective bulk composition after removing garnet and H2O frac from the previous step
+        if step > 1
+            effect_frac[step,:] .= 1 .- g_frac[step-1,:] .- H2O_frac[step-1,:] .+ additional_H2O[step,:]
+        else
+            effect_frac[step,:] .= 1.0
+        end
+
+        # Run the minimization for each lithology
+        out[step] = deepcopy(single_point_minimization(P, T, data, X=X, Xoxides=Xoxides, name_solvus=true, sys_in=sys_in))
+
+        # extract water-excess
+        X, H2O_frac[step,:] = extract_H2O_PT(out[step], X)
+
+        # garnet fractionation
+        X, g_frac[step,:] = fractionate_Grt(out[step], X, g_factor)
+    end
+
+    effect_frac_total .= accumulate(.*, effect_frac, dims=1)
+
+    # Calculate the garnet, H2O and melt frac in function of effective frac
+    for i in eachindex(P_array)
+        g_frac_total[i,:], H2O_frac_total[i,:] = calculate_effect_frac(g_frac[i,:], H2O_frac[i,:], effect_frac_total[i,:])
+        melt_frac[i,:] = calculate_melt_frac(out[i], effect_frac_total[i,:])
+    end
+
+    # Cumulate the garnet and H2O frac
+    g_frac_total_cum .= accumulate(+, g_frac_total, dims=1)
+    H2O_frac_total_cum .= accumulate(+, H2O_frac_total, dims=1)
+    T_solidus = findfirst(x -> in("liq", out[x].ph), eachindex(T_array)) + (Tmin - 2)
+    return out, g_frac_total_cum, H2O_frac_total, H2O_frac_total_cum, melt_frac, T_solidus, effect_frac_total
+end
+
+function calculate_additional_H2O(T_array, out_og, og_fraction, H2O_frac_total)
+    metased_fraction = 1 - og_fraction
+    ratio = metased_fraction / og_fraction
+    additional_H2O = zeros(length(T_array), 3)
+    for step in eachindex(T_array)
+        if "liq" in out_og[step].ph
+            additional_H2O[step,:] = ratio.*(H2O_frac_total[step,:])
+        else
+            additional_H2O[step,:] = zeros(3)
+        end
+    end
+    return additional_H2O
+end
+
+function calculate_effect_frac(g_frac, H2O_frac, effect_frac)
+    g_frac_tot = zeros(3)
+    g_frac_tot .= g_frac .* effect_frac
+    H2O_frac_tot = zeros(3)
+    H2O_frac_tot .= H2O_frac .* effect_frac
+    return g_frac_tot, H2O_frac_tot
+end
+
+function calculate_melt_frac(out, effect_frac)
+    melt_fract = zeros(3)
+     if "liq" in out.ph
+        melt_fract[1] = out.ph_frac[findfirst(==("liq"), out.ph)] * effect_frac[1]
+        melt_fract[2] = out.ph_frac_vol[findfirst(==("liq"), out.ph)] * effect_frac[2]
+        melt_fract[3] = out.ph_frac_wt[findfirst(==("liq"), out.ph)] * effect_frac[3]
+    end
+    return melt_fract
+end
+
+function extract_H2O_PT(out, X; H2O_comp = [0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 0.0; 1.0])
+    H2O_frac = zeros(3)
     if "H2O" in out.ph
         H2O_index = findfirst(==("H2O"), out.ph)
-        H2O_frac = out.ph_frac[H2O_index]
-        H2O_frac_vol = out.ph_frac_vol[H2O_index]
-        X .= X .- (H2O_comp .* H2O_frac)
-        return H2O_frac, H2O_frac_vol
-    else
-        return 0.0, 0.0
+        H2O_frac[1] = out.ph_frac[H2O_index]
+        H2O_frac[2] = out.ph_frac_vol[H2O_index]
+        H2O_frac[3] = out.ph_frac_wt[H2O_index]
+        X .= X .- ((H2O_comp) .* H2O_frac[1])  # remove only the excess
     end
+    return X, H2O_frac
 end
 
-"""
-    fractionate_garnet!(X::Vector{Float64}, out, g_factor::Float64)
-
-Remove fractionated garnet from bulk composition.
-
-# Arguments
-- `X::Vector{Float64}`: Bulk composition (modified in place)
-- `out`: MAGEMin output structure  
-- `g_factor::Float64`: Fraction of garnet to remove (0.0-1.0)
-
-# Returns
-- `g_frac::Float64`: Molar fraction of fractionated garnet
-- `g_frac_vol::Float64`: Volume fraction of fractionated garnet
-"""
-function fractionate_garnet!(X::Vector{Float64}, out, g_factor::Float64)
+function fractionate_Grt(out, X, g_factor)
+    g_frac = zeros(3)
     if "g" in out.ph
         g_index = findfirst(==("g"), out.ph)
-        garnet_comp = out.SS_vec[g_index].Comp
-        g_frac = out.ph_frac[g_index] * g_factor
-        g_frac_vol = out.ph_frac_vol[g_index] * g_factor
-        X .= X .- (garnet_comp .* g_frac)
-        return g_frac, g_frac_vol
-    else
-        return 0.0, 0.0
+        X .= X .- (out.SS_vec[g_index].Comp) .* out.ph_frac[g_index] .* g_factor
+        g_frac[1] = out.ph_frac[g_index] .* g_factor
+        g_frac[2] = out.ph_frac_vol[g_index] .* g_factor
+        g_frac[3] = out.ph_frac_wt[g_index] .* g_factor
     end
+    return X, g_frac
 end
 
-"""
-    find_solidus_temperature(out_array::Vector, T_array::Vector{Float64})
-
-Find the solidus temperature (first appearance of melt).
-
-# Arguments
-- `out_array::Vector`: Array of MAGEMin output structures
-- `T_array::Vector{Float64}`: Temperature array
-
-# Returns
-- `T_solidus::Float64`: Solidus temperature in °C
-"""
-function find_solidus_temperature(out_array::Vector, T_array::Vector{Float64})
-    idx = findfirst(x -> "liq" in out_array[x].ph, eachindex(T_array))
-    if isnothing(idx)
-        return NaN
-    end
-    return T_array[idx]
-end
-
-"""
-    initialize_lithology_results(name::String, n_steps::Int, X_init::Vector{Float64})
-
-Initialize a LithologyResults structure with zeroed arrays.
-"""
-function initialize_lithology_results(name::String, n_steps::Int, X_init::Vector{Float64})
-    return LithologyResults(
-        name,
-        Vector{MAGEMin_C.gmin_struct{Float64,Int64}}(undef, n_steps),
-        copy(X_init),
-        zeros(n_steps), zeros(n_steps),  # g_frac, g_frac_vol
-        zeros(n_steps), zeros(n_steps),  # g_frac_total, g_frac_total_vol
-        zeros(n_steps), zeros(n_steps),  # g_frac_total_cum, g_frac_total_vol_cum
-        zeros(n_steps), zeros(n_steps),  # H2O_frac, H2O_frac_vol
-        zeros(n_steps), zeros(n_steps),  # H2O_frac_total, H2O_frac_total_vol
-        zeros(n_steps), zeros(n_steps),  # H2O_frac_total_cum, H2O_frac_total_vol_cum
-        zeros(n_steps),                   # melt_frac_total_vol_cum
-        zeros(n_steps), zeros(n_steps),  # effective_fractions, effective_fractions_vol
-        zeros(n_steps), zeros(n_steps),  # effect_fract_total, effect_fract_total_vol
-        0.0                               # T_solidus
-    )
-end
-
-# ============================================================================
-# Core Simulation Functions
-# ============================================================================
-
-"""
-    run_lithology_along_path!(results::LithologyResults, P_array, T_array, 
-                              data, config::PTPathConfig)
-
-Run minimization along P-T path for a single lithology with garnet fractionation.
-
-# Arguments
-- `results::LithologyResults`: Results structure (modified in place)
-- `P_array::Vector{Float64}`: Pressure array
-- `T_array::Vector{Float64}`: Temperature array
-- `data`: MAGEMin data structure
-- `config::PTPathConfig`: Configuration
-"""
-function run_lithology_along_path!(results::LithologyResults, P_array::Vector{Float64}, 
-                                   T_array::Vector{Float64}, data, config::PTPathConfig)
-    n_steps = length(T_array)
-    
-    for step in 1:n_steps
-        T = T_array[step]
-        P = P_array[step]
-        
-        # Calculate effective fractions from previous step
-        if step > 1
-            results.effective_fractions[step] = 1 - results.g_frac[step-1] - results.H2O_frac[step-1]
-            results.effective_fractions_vol[step] = 1 - results.g_frac_vol[step-1] - results.H2O_frac_vol[step-1]
+function plot_fig_pl(T_array, out_mp, out_mg, out_og, T_solidus_mp, T_solidus_mg, T_solidus_og)
+    Pl_mp = zeros(length(T_array))
+    Pl_mg = zeros(length(T_array))
+    Pl_og = zeros(length(T_array))
+    for step in eachindex(T_array)
+        if "pl" in out_mp[step].ph
+            idx_an_mp = findfirst(==("an"), out_mp[step].SS_vec[findfirst(==("pl"), out_mp[step].ph)].emNames)
+            Pl_mp[step] = out_mp[step].SS_vec[findfirst(==("pl"), out_mp[step].ph)].emFrac[idx_an_mp]
         else
-            results.effective_fractions[step] = 1.0
-            results.effective_fractions_vol[step] = 1.0
+            Pl_mp[step] = NaN
         end
-        
-        # Run minimization
-        results.out[step] = deepcopy(single_point_minimization(
-            P, T, data, 
-            X=results.X, Xoxides=XOXIDES, 
-            name_solvus=true, sys_in=config.sys_in
-        ))
-        
-        # Extract water excess
-        results.H2O_frac[step], results.H2O_frac_vol[step] = extract_water_excess!(
-            results.X, results.out[step], H2O_COMP
-        )
-        
-        # Fractionate garnet
-        results.g_frac[step], results.g_frac_vol[step] = fractionate_garnet!(
-            results.X, results.out[step], config.g_factor
-        )
-    end
-    
-    # Calculate cumulative fractions
-    results.effect_fract_total .= accumulate(*, results.effective_fractions)
-    results.effect_fract_total_vol .= accumulate(*, results.effective_fractions_vol)
-    
-    for i in 1:n_steps
-        results.g_frac_total[i] = results.g_frac[i] * results.effect_fract_total[i]
-        results.g_frac_total_vol[i] = results.g_frac_vol[i] * results.effect_fract_total_vol[i]
-        results.H2O_frac_total[i] = results.H2O_frac[i] * results.effect_fract_total[i]
-        results.H2O_frac_total_vol[i] = results.H2O_frac_vol[i] * results.effect_fract_total_vol[i]
-        
-        if "liq" in results.out[i].ph
-            liq_idx = findfirst(==("liq"), results.out[i].ph)
-            results.melt_frac_total_vol_cum[i] = results.out[i].ph_frac_vol[liq_idx] * results.effect_fract_total_vol[i]
-        end
-    end
-    
-    results.g_frac_total_cum .= accumulate(+, results.g_frac_total)
-    results.g_frac_total_vol_cum .= accumulate(+, results.g_frac_total_vol)
-    results.H2O_frac_total_cum .= accumulate(+, results.H2O_frac_total)
-    results.H2O_frac_total_vol_cum .= accumulate(+, results.H2O_frac_total_vol)
-    
-    results.T_solidus = find_solidus_temperature(results.out, T_array)
-end
-
-"""
-    run_water_fluxed_melting!(results::LithologyResults, water_source::LithologyResults,
-                              og_init::LithologyResults, P_array, T_array, data, config;
-                              water_ratio::Float64=1.0)
-
-Run water-fluxed melting simulation for orthogneiss receiving water from another lithology.
-
-# Arguments
-- `results::LithologyResults`: Results structure for water-fluxed system (modified in place)
-- `water_source::LithologyResults`: Source lithology providing water
-- `og_init::LithologyResults`: Initial orthogneiss results (for solidus check)
-- `P_array`, `T_array`: P-T arrays
-- `data`: MAGEMin data structure
-- `config::PTPathConfig`: Configuration
-- `water_ratio::Float64`: Ratio of water source to orthogneiss (default 1.0)
-"""
-function run_water_fluxed_melting!(results::LithologyResults, water_source::LithologyResults,
-                                   og_init::LithologyResults, P_array::Vector{Float64}, 
-                                   T_array::Vector{Float64}, data, config::PTPathConfig;
-                                   water_ratio::Float64=1.0)
-    n_steps = length(T_array)
-    Tmin = config.Tmin
-    T_step = config.T_step
-    
-    for step in 1:n_steps
-        T = T_array[step]
-        P = P_array[step]
-        
-        # Add external water only when orthogneiss has melt
-        if "liq" in og_init.out[step].ph
-            external_H2O = water_ratio * water_source.H2O_frac_total[step]
-            external_H2O_vol = water_ratio * water_source.H2O_frac_total_vol[step]
+        if "pl" in out_mg[step].ph
+            idx_an_mg = findfirst(==("an"), out_mg[step].SS_vec[findfirst(==("pl"), out_mg[step].ph)].emNames)
+            Pl_mg[step] = out_mg[step].SS_vec[findfirst(==("pl"), out_mg[step].ph)].emFrac[idx_an_mg]
         else
-            external_H2O = 0.0
-            external_H2O_vol = 0.0
+            Pl_mg[step] = NaN
         end
-        
-        results.X .= results.X .+ external_H2O .* H2O_COMP
-        
-        # Calculate effective fractions
-        if step > 1
-            results.effective_fractions[step] = 1 - results.g_frac[step-1] + external_H2O
-            results.effective_fractions_vol[step] = 1 - results.g_frac_vol[step-1] + external_H2O_vol
+        if "pl" in out_og[step].ph
+            idx_an_og = findfirst(==("an"), out_og[step].SS_vec[findfirst(==("pl"), out_og[step].ph)].emNames)
+            Pl_og[step] = out_og[step].SS_vec[findfirst(==("pl"), out_og[step].ph)].emFrac[idx_an_og]
         else
-            results.effective_fractions[step] = 1.0
-            results.effective_fractions_vol[step] = 1.0
+            Pl_og[step] = NaN
         end
-        
-        # Run minimization
-        results.out[step] = deepcopy(single_point_minimization(
-            P, T, data,
-            X=results.X, Xoxides=XOXIDES,
-            name_solvus=true, sys_in=config.sys_in
-        ))
-        
-        # Fractionate garnet
-        results.g_frac[step], results.g_frac_vol[step] = fractionate_garnet!(
-            results.X, results.out[step], config.g_factor
-        )
-        
-        # Extract water excess only before orthogneiss solidus
-        solidus_step = Int((og_init.T_solidus - Tmin) / T_step) + 1
-        if "H2O" in results.out[step].ph && step < solidus_step
-            H2O_index = findfirst(==("H2O"), results.out[step].ph)
-            results.H2O_frac[step] = results.out[step].ph_frac[H2O_index]
-            results.H2O_frac_vol[step] = results.out[step].ph_frac_vol[H2O_index]
-            results.X .= results.X .- (H2O_COMP .* results.out[step].ph_frac[H2O_index])
+    end
+
+    fig_pl = Figure(size = (800, 600), fontsize = 30)
+    ax_pl = Axis(fig_pl[1, 1], xlabel="T (°C)", ylabel="Xan")
+    xlims!(ax_pl, minimum(T_array), maximum(T_array))
+    lines!(ax_pl, T_array, Pl_mp, color=:black, label="metapelite")
+    lines!(ax_pl, T_array, Pl_mg, color=:gray, label="metagraywacke")
+    lines!(ax_pl, T_array, Pl_og, color=:red, label="orthogneiss")
+    vlines!(ax_pl, T_solidus_mp, linestyle=:dash, color=:black, linewidth=1.5, label="T solidus MP")
+    vlines!(ax_pl, T_solidus_mg, linestyle=:dash, color=:gray, linewidth=1.5, label="T solidus MG")
+    vlines!(ax_pl, T_solidus_og, linestyle=:dash, color=:red, linewidth=1.5, label="T solidus OG")
+    display(fig_pl)  # Display the plot
+    return fig_pl
+end
+
+function plot_fig_melt_comp(T_array, out_mp, out_mg, out_og, out_og_mp_melt, out_og_mg_melt)
+    mp_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+    mg_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+    og_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+    og_mp_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+    og_mg_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+    for step in eachindex(T_array)
+        if "liq" in out_mp[step].ph
+            mp_melt_comp[:,step] = out_mp[step].SS_vec[findfirst(==("liq"), out_mp[step].ph)].Comp_wt .* 100
         else
-            results.H2O_frac[step] = 0.0
-            results.H2O_frac_vol[step] = 0.0
+            mp_melt_comp[:,step] = [NaN for _ in 1:11]
+        end
+        if "liq" in out_mg[step].ph
+            mg_melt_comp[:,step] = out_mg[step].SS_vec[findfirst(==("liq"), out_mg[step].ph)].Comp_wt .* 100
+        else
+            mg_melt_comp[:,step] = [NaN for _ in 1:11]
+        end
+        if "liq" in out_og[step].ph
+            og_melt_comp[:,step] = out_og[step].SS_vec[findfirst(==("liq"), out_og[step].ph)].Comp_wt .* 100
+        else
+            og_melt_comp[:,step] = [NaN for _ in 1:11]
+        end
+        if "liq" in out_og_mp_melt[step].ph
+            og_mp_melt_comp[:,step] = out_og_mp_melt[step].SS_vec[findfirst(==("liq"), out_og_mp_melt[step].ph)].Comp_wt .* 100
+        else
+            og_mp_melt_comp[:,step] = [NaN for _ in 1:11]
+        end
+        if "liq" in out_og_mg_melt[step].ph
+            og_mg_melt_comp[:,step] = out_og_mg_melt[step].SS_vec[findfirst(==("liq"), out_og_mg_melt[step].ph)].Comp_wt .* 100
+        else
+            og_mg_melt_comp[:,step] = [NaN for _ in 1:11]
         end
     end
-    
-    # Calculate cumulative fractions
-    results.effect_fract_total .= accumulate(*, results.effective_fractions)
-    results.effect_fract_total_vol .= accumulate(*, results.effective_fractions_vol)
-    
-    for i in 1:n_steps
-        results.g_frac_total[i] = results.g_frac[i] * results.effect_fract_total[i]
-        results.g_frac_total_vol[i] = results.g_frac_vol[i] * results.effect_fract_total_vol[i]
-        results.H2O_frac_total[i] = results.H2O_frac[i] * results.effect_fract_total[i]
-        results.H2O_frac_total_vol[i] = results.H2O_frac_vol[i] * results.effect_fract_total_vol[i]
-        
-        if "liq" in results.out[i].ph
-            liq_idx = findfirst(==("liq"), results.out[i].ph)
-            results.melt_frac_total_vol_cum[i] = results.out[i].ph_frac_vol[liq_idx] * results.effect_fract_total_vol[i]
-        end
-    end
-    
-    results.g_frac_total_cum .= accumulate(+, results.g_frac_total)
-    results.g_frac_total_vol_cum .= accumulate(+, results.g_frac_total_vol)
-    results.H2O_frac_total_cum .= accumulate(+, results.H2O_frac_total)
-    results.H2O_frac_total_vol_cum .= accumulate(+, results.H2O_frac_total_vol)
-    
-    results.T_solidus = find_solidus_temperature(results.out, T_array)
+
+    fig_melt_comp = Figure(size = (1600, 2400), fontsize = 40)
+    ax_h2O = Axis(fig_melt_comp[1, 1], xlabel="T (°C)", ylabel="H2O wt% in melt")
+    xlims!(ax_h2O, minimum(T_array), maximum(T_array))
+    lines!(ax_h2O, T_array, mp_melt_comp[11,:], color=:black, label="metapelite")
+    lines!(ax_h2O, T_array, mg_melt_comp[11,:], color=:gray, label="metagraywacke")
+    lines!(ax_h2O, T_array, og_melt_comp[11,:], color=:pink, label="orthogneiss without fluid transfer")
+    lines!(ax_h2O, T_array, og_mp_melt_comp[11,:], color=:purple, label="orthogneiss with fluid transfer from metapelite")
+    lines!(ax_h2O, T_array, og_mg_melt_comp[11,:], color=:red, label="orthogneiss with fluid transfer from metagraywacke")
+    # axislegend(ax_h2O, position=:lb)
+    ax_SiO2 = Axis(fig_melt_comp[1, 2], xlabel="T (°C)", ylabel="SiO2 wt% in melt")
+    xlims!(ax_SiO2, minimum(T_array), maximum(T_array))
+    lines!(ax_SiO2, T_array, mp_melt_comp[1,:], color=:black, label="metapelite")
+    lines!(ax_SiO2, T_array, mg_melt_comp[1,:], color=:gray, label="metagraywacke")
+    lines!(ax_SiO2, T_array, og_melt_comp[1,:], color=:pink, label="orthogneiss without fluid transfer")
+    lines!(ax_SiO2, T_array, og_mp_melt_comp[1,:], color=:purple, label="orthogneiss with fluid transfer from metapelite")
+    lines!(ax_SiO2, T_array, og_mg_melt_comp[1,:], color=:red, label="orthogneiss with fluid transfer from metagraywacke")
+    ax_al2O3 = Axis(fig_melt_comp[2, 1], xlabel="T (°C)", ylabel="Al2O3 wt% in melt")
+    xlims!(ax_al2O3, minimum(T_array), maximum(T_array))
+    lines!(ax_al2O3, T_array, mp_melt_comp[2,:], color=:black, label="metapelite")
+    lines!(ax_al2O3, T_array, mg_melt_comp[2,:], color=:gray, label="metagraywacke")
+    lines!(ax_al2O3, T_array, og_melt_comp[2,:], color=:pink, label="orthogneiss without fluid transfer")
+    lines!(ax_al2O3, T_array, og_mp_melt_comp[2,:], color=:purple, label="orthogneiss with fluid transfer from metapelite")
+    lines!(ax_al2O3, T_array, og_mg_melt_comp[2,:], color=:red, label="orthogneiss with fluid transfer from metagraywacke")
+    ax_CaO = Axis(fig_melt_comp[2, 2], xlabel="T (°C)", ylabel="CaO wt% in melt")
+    xlims!(ax_CaO, minimum(T_array), maximum(T_array))
+    lines!(ax_CaO, T_array, mp_melt_comp[3,:], color=:black, label="metapelite")
+    lines!(ax_CaO, T_array, mg_melt_comp[3,:], color=:gray, label="metagraywacke")
+    lines!(ax_CaO, T_array, og_melt_comp[3,:], color=:pink, label="orthogneiss without fluid transfer")
+    lines!(ax_CaO, T_array, og_mp_melt_comp[3,:], color=:purple, label="orthogneiss with fluid transfer from metapelite")
+    lines!(ax_CaO, T_array, og_mg_melt_comp[3,:], color=:red, label="orthogneiss with fluid transfer from metagraywacke")
+    ax_MgO = Axis(fig_melt_comp[3, 1], xlabel="T (°C)", ylabel="MgO wt% in melt")
+    xlims!(ax_MgO, minimum(T_array), maximum(T_array))
+    lines!(ax_MgO, T_array, mp_melt_comp[4,:], color=:black, label="metapelite")
+    lines!(ax_MgO, T_array, mg_melt_comp[4,:], color=:gray, label="metagraywacke")
+    lines!(ax_MgO, T_array, og_melt_comp[4,:], color=:pink, label="orthogneiss without fluid transfer")
+    lines!(ax_MgO, T_array, og_mp_melt_comp[4,:], color=:purple, label="orthogneiss with fluid transfer from metapelite")
+    lines!(ax_MgO, T_array, og_mg_melt_comp[4,:], color=:red, label="orthogneiss with fluid transfer from metagraywacke")
+    ax_FeO = Axis(fig_melt_comp[3, 2], xlabel="T (°C)", ylabel="FeO wt% in melt")
+    xlims!(ax_FeO, minimum(T_array), maximum(T_array))
+    lines!(ax_FeO, T_array, mp_melt_comp[5,:], color=:black, label="metapelite")
+    lines!(ax_FeO, T_array, mg_melt_comp[5,:], color=:gray, label="metagraywacke")
+    lines!(ax_FeO, T_array, og_melt_comp[5,:], color=:pink, label="orthogneiss without fluid transfer")
+    lines!(ax_FeO, T_array, og_mp_melt_comp[5,:], color=:purple, label="orthogneiss with fluid transfer from metapelite")
+    lines!(ax_FeO, T_array, og_mg_melt_comp[5,:], color=:red, label="orthogneiss with fluid transfer from metagraywacke")
+    ax_K2O = Axis(fig_melt_comp[4, 1], xlabel="T (°C)", ylabel="K2O wt% in melt")
+    xlims!(ax_K2O, minimum(T_array), maximum(T_array))
+    lines!(ax_K2O, T_array, mp_melt_comp[6,:], color=:black, label="metapelite")
+    lines!(ax_K2O, T_array, mg_melt_comp[6,:], color=:gray, label="metagraywacke")
+    lines!(ax_K2O, T_array, og_melt_comp[6,:], color=:pink, label="orthogneiss without fluid transfer")
+    lines!(ax_K2O, T_array, og_mp_melt_comp[6,:], color=:purple, label="orthogneiss with fluid transfer from metapelite")
+    lines!(ax_K2O, T_array, og_mg_melt_comp[6,:], color=:red, label="orthogneiss with fluid transfer from metagraywacke")
+    ax_Na2O = Axis(fig_melt_comp[4, 2], xlabel="T (°C)", ylabel="Na2O wt% in melt")
+    xlims!(ax_Na2O, minimum(T_array), maximum(T_array))
+    lines!(ax_Na2O, T_array, mp_melt_comp[7,:], color=:black, label="metapelite")
+    lines!(ax_Na2O, T_array, mg_melt_comp[7,:], color=:gray, label="metagraywacke")
+    lines!(ax_Na2O, T_array, og_melt_comp[7,:], color=:pink, label="orthogneiss without fluid transfer")
+    lines!(ax_Na2O, T_array, og_mp_melt_comp[7,:], color=:purple, label="orthogneiss with fluid transfer from metapelite")
+    lines!(ax_Na2O, T_array, og_mg_melt_comp[7,:], color=:red, label="orthogneiss with fluid transfer from metagraywacke")
+    display(fig_melt_comp)
+    return fig_melt_comp
 end
 
-"""
-    remove_initial_water_excess!(X::Vector{Float64}, P::Float64, T::Float64, data, config)
-
-Remove excess water from initial composition at starting P-T conditions.
-
-# Returns
-- `X::Vector{Float64}`: Modified composition with water excess removed
-"""
-function remove_initial_water_excess!(X::Vector{Float64}, P::Float64, T::Float64, data, config::PTPathConfig)
-    out_init = single_point_minimization(P, T, data, X=X, Xoxides=XOXIDES, name_solvus=true, sys_in=config.sys_in)
-    
-    if "H2O" in out_init.ph
-        H2O_index = findfirst(==("H2O"), out_init.ph)
-        X .= X .- (H2O_COMP .* out_init.ph_frac[H2O_index])
-    else
-        error("Initial composition must contain H2O to proceed with water-excess calculation.")
-    end
-    
-    X .= X ./ sum(X)
-    return X
-end
-
-# ============================================================================
-# Main Simulation Function
-# ============================================================================
-
-"""
-    run_water_melt_simulation(config::PTPathConfig=PTPathConfig(); 
-                              compositions::Dict=default_compositions(),
-                              mp_og_ratio::Float64=1.0,
-                              mg_og_ratio::Float64=1.0,
-                              verbose::Bool=true)
-
-Run the complete water-melt simulation along a P-T path.
-
-# Arguments
-- `config::PTPathConfig`: P-T path configuration
-- `compositions::Dict`: Dictionary of BulkComposition objects
-- `mp_og_ratio::Float64`: Ratio of metapelite to orthogneiss for water flux (default 1.0)
-- `mg_og_ratio::Float64`: Ratio of metagraywacke to orthogneiss for water flux (default 1.0)
-- `verbose::Bool`: Print progress information (default true)
-
-# Returns
-- `SimulationResults`: Complete simulation results
-"""
-function run_water_melt_simulation(config::PTPathConfig=PTPathConfig();
-                                   compositions::Dict=default_compositions(),
-                                   mp_og_ratio::Float64=1.0,
-                                   mg_og_ratio::Float64=1.0,
-                                   verbose::Bool=true)
-    
-    # Initialize MAGEMin
-    data = Initialize_MAGEMin("mp", verbose=false)
-    
-    try
-        # Create P-T arrays
-        T_array, P_array = create_pt_arrays(config)
-        n_steps = length(T_array)
-        
-        verbose && println("Running simulation with $(n_steps) steps from $(config.Tmin)°C to $(config.Tmax)°C")
-        
-        # Prepare compositions
-        X_mp = prepare_composition(compositions["metapelite"])
-        X_mg = prepare_composition(compositions["metagraywacke"])
-        X_og = prepare_composition(compositions["orthogneiss"])
-        
-        # Remove initial water excess
-        remove_initial_water_excess!(X_mp, P_array[1], T_array[1], data, config)
-        remove_initial_water_excess!(X_mg, P_array[1], T_array[1], data, config)
-        remove_initial_water_excess!(X_og, P_array[1], T_array[1], data, config)
-        
-        # Initialize results structures
-        results_mp = initialize_lithology_results("metapelite", n_steps, X_mp)
-        results_mg = initialize_lithology_results("metagraywacke", n_steps, X_mg)
-        results_og = initialize_lithology_results("orthogneiss", n_steps, X_og)
-        
-        # Run main lithologies
-        verbose && println("Computing metapelite, metagraywacke, and orthogneiss...")
-        @showprogress enabled=verbose for (results, name) in [(results_mp, "mp"), (results_mg, "mg"), (results_og, "og")]
-            run_lithology_along_path!(results, P_array, T_array, data, config)
-        end
-        
-        verbose && println("\nSolidus temperatures:")
-        verbose && println("  Metapelite: $(results_mp.T_solidus)°C")
-        verbose && println("  Metagraywacke: $(results_mg.T_solidus)°C")
-        verbose && println("  Orthogneiss: $(results_og.T_solidus)°C")
-        
-        # Calculate water released between solidi
-        if !isnan(results_mp.T_solidus) && !isnan(results_og.T_solidus)
-            idx_mp = Int((results_mp.T_solidus - config.Tmin) / config.T_step) + 1
-            idx_og = Int((results_og.T_solidus - config.Tmin) / config.T_step) + 1
-            H2O_mp_released = results_mp.H2O_frac_total_cum[idx_mp] - results_mp.H2O_frac_total_cum[idx_og]
-            verbose && println("\nH2O released (MP, between solidi): $(round(H2O_mp_released*100, digits=2))%")
-        end
-        
-        if !isnan(results_mg.T_solidus) && !isnan(results_og.T_solidus)
-            idx_mg = Int((results_mg.T_solidus - config.Tmin) / config.T_step) + 1
-            idx_og = Int((results_og.T_solidus - config.Tmin) / config.T_step) + 1
-            H2O_mg_released = results_mg.H2O_frac_total_cum[idx_mg] - results_mg.H2O_frac_total_cum[idx_og]
-            verbose && println("H2O released (MG, between solidi): $(round(H2O_mg_released*100, digits=2))%")
-        end
-        
-        # Water-fluxed melting simulations
-        X_og_mp = prepare_composition(compositions["orthogneiss"])
-        X_og_mg = prepare_composition(compositions["orthogneiss"])
-        remove_initial_water_excess!(X_og_mp, P_array[1], T_array[1], data, config)
-        remove_initial_water_excess!(X_og_mg, P_array[1], T_array[1], data, config)
-        
-        results_og_mp = initialize_lithology_results("orthogneiss+mp_water", n_steps, X_og_mp)
-        results_og_mg = initialize_lithology_results("orthogneiss+mg_water", n_steps, X_og_mg)
-        
-        verbose && println("\nComputing water-fluxed orthogneiss (MP water source)...")
-        run_water_fluxed_melting!(results_og_mp, results_mp, results_og, P_array, T_array, data, config; 
-                                  water_ratio=mp_og_ratio)
-        
-        verbose && println("Computing water-fluxed orthogneiss (MG water source)...")
-        run_water_fluxed_melting!(results_og_mg, results_mg, results_og, P_array, T_array, data, config;
-                                  water_ratio=mg_og_ratio)
-        
-        # Compile results
-        lithologies = Dict(
-            "metapelite" => results_mp,
-            "metagraywacke" => results_mg,
-            "orthogneiss" => results_og,
-            "orthogneiss+mp_water" => results_og_mp,
-            "orthogneiss+mg_water" => results_og_mg
-        )
-        
-        return SimulationResults(config, T_array, P_array, lithologies)
-        
-    finally
-        Finalize_MAGEMin(data)
-    end
-end
-
-# ============================================================================
-# Plotting Functions
-# ============================================================================
-
-"""
-    plot_water_release(results::SimulationResults; save_path::String="")
-
-Plot cumulative water release for all lithologies.
-"""
-function plot_water_release(results::SimulationResults; save_path::String="")
-    fig = Figure(size=(800, 700))
-    ax = Axis(fig[1, 1], xlabel="T (°C)", ylabel="H₂O fraction", title="Cumulative Water Release")
-    
-    T = results.T_array
-    
-    lines!(ax, T, results.lithologies["metapelite"].H2O_frac_total_cum, color=:black, label="Metapelite")
-    lines!(ax, T, results.lithologies["metagraywacke"].H2O_frac_total_cum, color=:blue, label="Metagraywacke")
-    
-    # Solidus lines
-    vlines!(ax, results.lithologies["metapelite"].T_solidus, linestyle=:dash, color=:black, linewidth=1.5)
-    vlines!(ax, results.lithologies["metagraywacke"].T_solidus, linestyle=:dash, color=:blue, linewidth=1.5)
-    vlines!(ax, results.lithologies["orthogneiss"].T_solidus, linestyle=:dash, color=:red, linewidth=1.5, label="OG solidus")
-    
+function plot_fig1(T_array, H2O_frac_mp_total_cum, H2O_frac_mg_total_cum, T_solidus_mp, T_solidus_mg, T_solidus_og, H2O_released_mp, H2O_released_mg)
+    fig1 = Figure(size = (800, 700))
+    ax = Axis(fig1[1, 1], xlabel="T (°C)", ylabel="H2O_frac", title="H2O_frac vs T")
+    xlims!(ax, minimum(T_array), maximum(T_array))
+    ylims!(ax, 0.0, (H2O_frac_mp_total_cum[end,3]*100 + 0.1))
+    lines!(ax, T_array, H2O_frac_mp_total_cum[:,3]*100, color=:black, label="metapelite")
+    lines!(ax, T_array, H2O_frac_mg_total_cum[:,3]*100, color=:gray, label="metagraywacke")
+    # Add vertical dashed lines for solidus temperatures
+    vlines!(ax, T_solidus_mp, linestyle=:dash, color=:black, linewidth=1.5, label="T solidus MP")
+    vlines!(ax, T_solidus_mg, linestyle=:dash, color=:gray, linewidth=1.5, label="T solidus MG")
+    vlines!(ax, T_solidus_og, linestyle=:dash, color=:red, linewidth=1.5, label="T solidus OG")
+    # Add text annotation with the water values
+    text!(ax, 0.95, 0.05, text="H₂O MP = $(round(H2O_released_mp[3]*100, digits=4)) wt%\nH₂O MG = $(round(H2O_released_mg[3]*100, digits=4)) wt%",
+            fontsize=12, align=(:right, :bottom), space=:relative)
     axislegend(ax, position=:lt)
-    
-    if !isempty(save_path)
-        save(save_path, fig)
-    end
-    
-    return fig
+    display(fig1)  # Display the plot
+    return fig1
 end
 
-"""
-    plot_melt_fractions(results::SimulationResults; save_path::String="")
-
-Plot melt fractions for all lithologies including water-fluxed systems.
-"""
-function plot_melt_fractions(results::SimulationResults; save_path::String="")
-    fig = Figure(size=(800, 700))
-    ax = Axis(fig[1, 1], xlabel="T (°C)", ylabel="Melt fraction (vol)", title="Melt Production")
-    
-    T = results.T_array
-    
-    lines!(ax, T, results.lithologies["orthogneiss+mp_water"].melt_frac_total_vol_cum, color=:red, label="OG + H₂O (MP)")
-    lines!(ax, T, results.lithologies["orthogneiss+mg_water"].melt_frac_total_vol_cum, color=:purple, label="OG + H₂O (MG)")
-    lines!(ax, T, results.lithologies["metapelite"].melt_frac_total_vol_cum, color=:black, label="Metapelite")
-    lines!(ax, T, results.lithologies["metagraywacke"].melt_frac_total_vol_cum, color=:blue, label="Metagraywacke")
-    lines!(ax, T, results.lithologies["orthogneiss"].melt_frac_total_vol_cum, color=:pink, label="Orthogneiss")
-    
-    # Solidus lines
-    vlines!(ax, results.lithologies["metapelite"].T_solidus, linestyle=:dash, color=:black, linewidth=1.5)
-    vlines!(ax, results.lithologies["metagraywacke"].T_solidus, linestyle=:dash, color=:blue, linewidth=1.5)
-    vlines!(ax, results.lithologies["orthogneiss"].T_solidus, linestyle=:dash, color=:red, linewidth=1.5)
-    
+function plot_fig2(T_array, melt_frac_og_mp, melt_frac_og_mg, melt_frac_mp, melt_frac_mg, melt_frac_og, T_solidus_mp, T_solidus_mg, T_solidus_og)
+    fig2 = Figure(size = (800, 700))
+    ax = Axis(fig2[1, 1], xlabel="T (°C)", ylabel="Liq_frac", title="Liq_frac vs T")
+    xlims!(ax, minimum(T_array), maximum(T_array))
+    ylims!(ax, 0.0, 0.1)
+    lines!(ax, T_array, melt_frac_og_mp, color=:red, label="orthogneiss+water-mp")
+    lines!(ax, T_array, melt_frac_og_mg, color=:purple, label="orthogneiss+water-mg")
+    lines!(ax, T_array, melt_frac_mp, color=:black, label="metapelite")
+    lines!(ax, T_array, melt_frac_mg, color=:blue, label="metagraywacke")
+    lines!(ax, T_array, melt_frac_og, color=:pink, label="orthogneiss")
+    # Add vertical dashed lines for solidus temperatures
+    vlines!(ax, T_solidus_mp, linestyle=:dash, color=:black, linewidth=1.5, label="T solidus MP")
+    vlines!(ax, T_solidus_mg, linestyle=:dash, color=:blue, linewidth=1.5, label="T solidus MG")
+    vlines!(ax, T_solidus_og, linestyle=:dash, color=:red, linewidth=1.5, label="T solidus OG")
     axislegend(ax, position=:lt)
-    
-    if !isempty(save_path)
-        save(save_path, fig)
-    end
-    
-    return fig
+    display(fig2)  # Display the plot
+    return fig2
 end
 
-"""
-    get_phase_color(phase::String)
+function collect_phases(n_steps, out, effect_frac_total)
+    phase_names = unique(vcat([out[i].ph for i in 1:n_steps]...))
+    phase_names = filter(x -> x != "g", phase_names)  # Exclude garnet
+    n_phases = length(phase_names)
+    phase_frac = zeros(n_steps, n_phases)
 
-Get color for a phase, using default if not in color map.
-"""
-function get_phase_color(phase::String)
-    if haskey(PHASE_COLOR_MAP, phase)
-        return PHASE_COLOR_MAP[phase]
-    else
-        # Default colors for unknown phases
-        default_colors = [:lightcoral, :lightskyblue, :lightgreen, :lightsalmon, :plum]
-        return default_colors[mod1(hash(phase), length(default_colors))]
-    end
-end
-
-"""
-    plot_mode_boxes(results::SimulationResults; save_path::String="")
-
-Create mode box diagrams for all lithologies.
-"""
-function plot_mode_boxes(results::SimulationResults; save_path::String="")
-    fig = Figure(size=(1800, 1400))
-    
-    lithology_keys = ["metapelite", "metagraywacke", "orthogneiss+mp_water", "orthogneiss+mg_water"]
-    titles = ["Metapelite", "Metagraywacke", "Orthogneiss + H₂O (MP)", "Orthogneiss + H₂O (MG)"]
-    positions = [(1,1), (1,2), (2,1), (2,2)]
-    
-    T = results.T_array
-    n_steps = length(T)
-    all_phases = String[]
-    
-    for (key, title, pos) in zip(lithology_keys, titles, positions)
-        lith = results.lithologies[key]
-        ax = Axis(fig[pos...], xlabel="T (°C)", ylabel="Phase Fraction (molar)", title="Mode Box - $title")
-        xlims!(ax, minimum(T), maximum(T))
-        ylims!(ax, 0.0, 1.0)
-        
-        # Collect phases (excluding garnet)
-        phase_names = unique(vcat([lith.out[i].ph for i in 1:n_steps]...))
-        phase_names = filter(x -> x != "g", phase_names)
-        append!(all_phases, phase_names)
-        
-        # Calculate phase fractions
-        n_phases = length(phase_names)
-        phase_fractions = zeros(n_steps, n_phases)
-        
-        for i in 1:n_steps
-            for (j, phase) in enumerate(lith.out[i].ph)
-                if phase != "g"
-                    phase_idx = findfirst(==(phase), phase_names)
-                    if !isnothing(phase_idx)
-                        phase_fractions[i, phase_idx] = lith.out[i].ph_frac[j] * lith.effect_fract_total[i]
-                    end
+    for i in 1:n_steps
+        for (j, phase) in enumerate(out[i].ph)
+            if phase != "g"  # Skip garnet as it's fractionated
+                phase_idx = findfirst(==(phase), phase_names)
+                if !isnothing(phase_idx)
+                    # Scale by effective fraction to show what remains after fractionation
+                    phase_frac[i, phase_idx] = out[i].ph_frac[j] * effect_frac_total[i,1]
                 end
             end
         end
-        
-        # Plot bands
-        cumulative = zeros(n_steps)
-        for j in 1:n_phases
-            lower = copy(cumulative)
-            cumulative .+= phase_fractions[:, j]
-            band!(ax, T, lower, cumulative, color=get_phase_color(phase_names[j]))
-        end
-        
-        # Add fractionated garnet
-        lower_g = copy(cumulative)
-        cumulative_g = cumulative .+ lith.g_frac_total_cum
-        band!(ax, T, lower_g, cumulative_g, color=:indianred)
-        
-        # Add fractionated H2O
-        lower_h2o = copy(cumulative_g)
-        cumulative_h2o = cumulative_g .+ lith.H2O_frac_total_cum
-        band!(ax, T, lower_h2o, cumulative_h2o, color=:lightblue)
-        
-        # Solidus lines
-        vlines!(ax, results.lithologies["orthogneiss"].T_solidus, linestyle=:dash, color=:red, linewidth=1.5)
     end
-    
-    # Create legend
-    unique_phases = unique(all_phases)
-    legend_elements = LegendElement[PolyElement(color=get_phase_color(p)) for p in sort(unique_phases)]
-    legend_labels = sort(unique_phases)
-    
-    push!(legend_elements, PolyElement(color=:indianred))
+
+    return phase_names, phase_frac, n_phases
+end
+
+function ax_boxplot(ax, T_array, n_steps, phase_frac, g_frac_total_cum, H2O_frac_total_cum, phase_names, n_phases, T_solidus, T_og_solidus, phase_color_map)
+    xlims!(ax, minimum(T_array), maximum(T_array))
+    ylims!(ax, 0.0, 1.0)
+
+    cumulative = zeros(n_steps)
+    for j in 1:n_phases
+        lower = copy(cumulative)
+        cumulative .+= phase_frac[:, j]
+        band!(ax, T_array, lower, cumulative, color=phase_color_map[phase_names[j]], label=phase_names[j])
+    end
+
+    # Add garnet on top to show fractionated amount
+    lower_g = copy(cumulative)
+    cumulative_g = cumulative .+ g_frac_total_cum
+    band!(ax, T_array, lower_g, cumulative_g, color=(0.710, 0.173, 0.122), label="g (fractionated)")
+
+    # Add H2O on top to show fractionated water
+    lower_h2o = copy(cumulative_g)
+    cumulative_h2o = cumulative_g .+ H2O_frac_total_cum
+    band!(ax, T_array, lower_h2o, cumulative_h2o, color=:lightblue, label="H2O (fractionated)")
+
+    # Add vertical dashed lines for solidus temperatures
+    vlines!(ax, T_solidus, linestyle=:dash, color=:black, linewidth=1.5)
+    vlines!(ax, T_og_solidus, linestyle=:dash, color=:red, linewidth=1.5)
+    return ax
+end
+
+function plot_fig3(T_array, out_mp, out_mg, out_og, out_og_mp_melt, out_og_mg_melt, effect_frac_mp_total, effect_frac_mg_total, effect_frac_og_mp_melt_total, effect_frac_og_mg_melt_total, g_frac_mp_total_cum, g_frac_mg_total_cum, g_frac_og_total_cum, H2O_frac_mp_total_cum, H2O_frac_mg_total_cum, H2O_frac_og_total_cum, melt_frac_mp, melt_frac_mg, melt_frac_og, T_solidus_mp, T_solidus_mg, T_solidus_og, g_frac_og_mp_melt_total_cum, g_frac_og_mg_melt_total_cum, H2O_frac_og_mp_melt_total_cum, H2O_frac_og_mg_melt_total_cum, melt_frac_og_mp, melt_frac_og_mg)
+    n_steps = length(T_array)
+
+    phase_names_mp, phase_frac_mp, n_phases_mp = collect_phases(n_steps, out_mp, effect_frac_mp_total)
+    phase_names_mg, phase_frac_mg, n_phases_mg = collect_phases(n_steps, out_mg, effect_frac_mg_total)
+    phase_names_og_mp, phase_frac_og_mp, n_phases_og_mp = collect_phases(n_steps, out_og_mp_melt, effect_frac_og_mp_melt_total)
+    phase_names_og_mg, phase_frac_og_mg, n_phases_og_mg = collect_phases(n_steps, out_og_mg_melt, effect_frac_og_mg_melt_total)
+
+    # Create a unified color map for all phases across all three lithologies
+    all_phases = unique(vcat(phase_names_mp, phase_names_mg, phase_names_og_mp, phase_names_og_mg))
+
+    # Manual color assignment for each phase, from Lanari and Tedeschi (2024)
+    # You can customize these colors for each specific phase name
+    phase_color_map = Dict(
+        "liq"  => :red,                   # Melt/liquid
+        "pl"   => (0.925, 0.863, 0.620),  # Plagioclase
+        "q"    => (1.000, 1.000, 1.000),  # Quartz
+        "bi"   => (0.463, 0.224, 0.129),  # Biotite
+        "mu"   => (0.851, 0.780, 0.796),  # Muscovite
+        "afs"  => (0.914, 0.722, 0.800),  # K-feldspar
+        "ilm"  => (0.878, 0.365, 0.165),  # Ilmenite
+        "sill" => (0.000, 0.561, 0.737),  # Sillimanite
+        "and"  => (0.498, 0.702, 0.757),  # Andalusite
+        "ky"   => (0.000, 0.357, 0.576),  # Kyanite
+        "crd"  => (0.533, 0.408, 0.659),  # Cordierite
+        "zo"   => (0.733, 0.706, 0.216),  # Zoisite
+        "H2O"  => :lightblue,             # Water
+        "g"    => (0.710, 0.173, 0.122),  # Garnet
+        "st"   => (0.886, 0.667, 0.000),  # Staurolite
+        "ttn"  => (0.745, 0.541, 0.263),  # Titanite
+        "ru"   => (0.024, 0.259, 0.463),  # Rutile
+        "chl"  => (0.506, 0.753, 0.443),  # Chlorite
+        "cld"  => (0.369, 0.467, 0.380),  # Chloritoid
+        "opx"  => (0.882, 0.486, 0.565),  # Orthopyroxene
+        "pat"  => (0.855, 0.514, 0.314)   # Paragonite
+    )
+
+    # For any phases not manually defined, assign default colors
+    base_colors = [:lightcoral, :lightskyblue, :lightgreen, :lightsalmon, :plum, :lightcyan, :khaki, :lightpink, :tan, :lightgray, :wheat, :peachpuff, :lavender, :thistle, :powderblue]
+    for (i, phase) in enumerate(all_phases)
+        if !haskey(phase_color_map, phase)
+            phase_color_map[phase] = base_colors[mod1(i, length(base_colors))]
+        end
+    end
+
+    # Create fig3 with 4 mode boxes (2x2 layout)
+    fig3 = Figure(size = (1800, 1400))
+
+    # Panel 1: Metapelite
+    ax3_mp = Axis(fig3[1, 1], xlabel="T (°C)", ylabel="Phase Fraction (molar)", title="Mode Box - Metapelite")
+    ax3_mp = ax_boxplot(ax3_mp, T_array, n_steps, phase_frac_mp, g_frac_mp_total_cum[:,1], H2O_frac_mp_total_cum[:,1], phase_names_mp, n_phases_mp, T_solidus_mp, T_solidus_og, phase_color_map)
+
+    # Panel 2: Metagraywacke
+    ax3_mg = Axis(fig3[1, 2], xlabel="T (°C)", ylabel="Phase Fraction (molar)", title="Mode Box - Metagraywacke")
+    ax3_mg = ax_boxplot(ax3_mg, T_array, n_steps, phase_frac_mg, g_frac_mg_total_cum[:,1], H2O_frac_mg_total_cum[:,1], phase_names_mg, n_phases_mg, T_solidus_mg, T_solidus_og, phase_color_map)
+
+    # Panel 3: Orthogneiss + Water from Metapelite
+    ax3_og_mp = Axis(fig3[2, 1], xlabel="T (°C)", ylabel="Phase Fraction (molar)", title="Mode Box - Orthogneiss + H₂O from MP")
+    ax3_og_mp = ax_boxplot(ax3_og_mp, T_array, n_steps, phase_frac_og_mp, g_frac_og_mp_melt_total_cum[:,1], H2O_frac_og_mp_melt_total_cum[:,1], phase_names_og_mp, n_phases_og_mp, T_solidus_mp, T_solidus_og, phase_color_map)
+
+    # Panel 4: Orthogneiss + Water from Metagraywacke
+    ax3_og_mg = Axis(fig3[2, 2], xlabel="T (°C)", ylabel="Phase Fraction (molar)", title="Mode Box - Orthogneiss + H₂O from MG")
+    ax3_og_mg = ax_boxplot(ax3_og_mg, T_array, n_steps, phase_frac_og_mg, g_frac_og_mg_melt_total_cum[:,1], H2O_frac_og_mg_melt_total_cum[:,1], phase_names_og_mg, n_phases_og_mg, T_solidus_mg, T_solidus_og, phase_color_map)
+
+    # Create a common legend for all unique phases across all four subplots
+    legend_elements = []
+    legend_labels = []
+
+    # Add all unique phases with their colors
+    for phase in sort(all_phases)
+        push!(legend_elements, PolyElement(color=phase_color_map[phase]))
+        push!(legend_labels, phase)
+    end
+
+    # Add garnet and H2O
+    push!(legend_elements, PolyElement(color=(0.710, 0.173, 0.122)))
     push!(legend_labels, "g (fractionated)")
     push!(legend_elements, PolyElement(color=:lightblue))
-    push!(legend_labels, "H₂O (fractionated)")
+    push!(legend_labels, "H2O (fractionated)")
+
+    # Add solidus lines
+    push!(legend_elements, LineElement(color=:black, linestyle=:dash))
+    push!(legend_labels, "T solidus MP")
+    push!(legend_elements, LineElement(color=:blue, linestyle=:dash))
+    push!(legend_labels, "T solidus MG")
     push!(legend_elements, LineElement(color=:red, linestyle=:dash))
-    push!(legend_labels, "OG solidus")
-    
-    Legend(fig[1:2, 3], legend_elements, legend_labels)
-    
-    if !isempty(save_path)
-        save(save_path, fig)
-    end
-    
-    return fig
-end
+    push!(legend_labels, "T solidus OG")
 
-"""
-    plot_results(results::SimulationResults; output_dir::String=".")
-
-Generate and save all plots.
-"""
-function plot_results(results::SimulationResults; output_dir::String=".")
-    fig1 = plot_water_release(results; save_path=joinpath(output_dir, "H2O_frac.svg"))
-    fig2 = plot_melt_fractions(results; save_path=joinpath(output_dir, "Liq_frac.svg"))
-    fig3 = plot_mode_boxes(results; save_path=joinpath(output_dir, "Mode_Boxes.svg"))
-    
-    display(fig1)
-    display(fig2)
+    # Place legend spanning both rows on the right side
+    Legend(fig3[1:2, 3], legend_elements, legend_labels, framevisible=true)
     display(fig3)
-    
-    return (fig1, fig2, fig3)
-end
-
-# ============================================================================
-# Data Export Functions
-# ============================================================================
-
-"""
-    save_results(results::SimulationResults, output_dir::String=".")
-
-Save simulation results to CSV files.
-"""
-function save_results(results::SimulationResults, output_dir::String=".")
-    # Create summary DataFrame
-    df = DataFrame(
-        T = results.T_array,
-        P = results.P_array
-    )
-    
-    for (name, lith) in results.lithologies
-        short_name = replace(name, "+" => "_", " " => "_")
-        df[!, "$(short_name)_H2O_cum"] = lith.H2O_frac_total_cum
-        df[!, "$(short_name)_g_cum"] = lith.g_frac_total_cum
-        df[!, "$(short_name)_melt_vol"] = lith.melt_frac_total_vol_cum
-    end
-    
-    CSV.write(joinpath(output_dir, "simulation_results.csv"), df)
-    
-    println("Results saved to $(joinpath(output_dir, "simulation_results.csv"))")
-    
-    return df
+    return fig3
 end
 
 end # module
