@@ -120,8 +120,8 @@ println("T og+mp melt = $(T_array[idx_mp_exceeds]) °C")
 println("T og+mg melt = $(T_array[idx_mg_exceeds]) °C")
 println("melt_fraction_og_mp = $(melt_frac_og_mp[idx_mp_exceeds,3]*100)")
 println("melt_fraction_og_mg = $(melt_frac_og_mg[idx_mg_exceeds,3]*100)")
-println("melt_fraction_og_mg at T_solidus_mp = $(melt_frac_og_mg[Int(T_solidus_mp-Tmin),3]*100) %")
-println("melt_fraction_og_mp at T_solidus_mg = $(melt_frac_og_mp[Int(T_solidus_mg-Tmin),3]*100) %")
+println("melt_fraction_og_mp at T_solidus_mp = $(melt_frac_og_mp[Int(T_solidus_mp-Tmin+1),3]*100) %")
+println("melt_fraction_og_mg at T_solidus_mg = $(melt_frac_og_mg[Int(T_solidus_mg-Tmin+1),3]*100) %")
 
 
 """

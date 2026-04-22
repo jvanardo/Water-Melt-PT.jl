@@ -120,7 +120,7 @@ function run_PT_path(T_array, P_array, data, X, Xoxides, g_factor, sys_in, Tmin;
     # Cumulate the garnet and H2O frac
     g_frac_total_cum .= accumulate(+, g_frac_total, dims=1)
     H2O_frac_total_cum .= accumulate(+, H2O_frac_total, dims=1)
-    T_solidus = findfirst(x -> in("liq", out[x].ph), eachindex(T_array)) + (Tmin - 2)
+    T_solidus = findfirst(x -> in("liq", out[x].ph), eachindex(T_array)) + (Tmin - 1)
     return out, g_frac_total_cum, H2O_frac_total, H2O_frac_total_cum, melt_frac, T_solidus, effect_frac_total
 end
 
@@ -148,7 +148,7 @@ end
 
 function calculate_melt_frac(out, effect_frac)
     melt_fract = zeros(3)
-     if "liq" in out.ph
+    if "liq" in out.ph
         melt_fract[1] = out.ph_frac[findfirst(==("liq"), out.ph)] * effect_frac[1]
         melt_fract[2] = out.ph_frac_vol[findfirst(==("liq"), out.ph)] * effect_frac[2]
         melt_fract[3] = out.ph_frac_wt[findfirst(==("liq"), out.ph)] * effect_frac[3]
