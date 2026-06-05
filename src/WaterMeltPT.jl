@@ -32,7 +32,7 @@ using ProgressMeter
 export prepare_bulk_composition, define_PT_path, extract_init_H2O
 export run_PT_path, calculate_additional_H2O, calculate_effect_frac, calculate_melt_frac
 export extract_H2O_PT, fractionate_Grt
-export plot_fig_pl, plot_fig_melt_comp, plot_fig1, plot_fig2, plot_fig3, collect_phases, ax_boxplot
+export plot_fig_pl, plot_fig_melt_comp, plot_fig1, plot_fig2, plot_fig3, collect_phases, ax_boxplot, plot_ternary_diagrams
 
 function prepare_bulk_composition(X_init_wt, X_init_ox, P_array, T_array, data, sys_in;
                                 M_oxides = [60.08; 101.96; 56.08; 40.30; 71.85; 159.69; 94.20; 61.98; 79.87; 70.94; 18.02],
@@ -492,6 +492,166 @@ function plot_fig3(T_array, out_mp, out_mg, out_og, out_og_mp_melt, out_og_mg_me
     Legend(fig3[1:2, 3], legend_elements, legend_labels, framevisible=true)
     display(fig3)
     return fig3
+end
+
+function plot_ternary_diagrams(T_array, out_mp, out_mg, out_og, out_og_mp_melt, out_og_mg_melt)
+    mp_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+    mg_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+    og_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+    og_mp_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+    og_mg_melt_comp = Matrix{Float64}(undef, 11, length(T_array))
+
+    for step in eachindex(T_array)
+        if "liq" in out_mp[step].ph
+            mp_melt_comp[:,step] = out_mp[step].SS_vec[findfirst(==("liq"), out_mp[step].ph)].Comp .* 100
+        else
+            mp_melt_comp[:,step] = [NaN for _ in 1:11]
+        end
+        if "liq" in out_mg[step].ph
+            mg_melt_comp[:,step] = out_mg[step].SS_vec[findfirst(==("liq"), out_mg[step].ph)].Comp .* 100
+        else
+            mg_melt_comp[:,step] = [NaN for _ in 1:11]
+        end
+        if "liq" in out_og[step].ph
+            og_melt_comp[:,step] = out_og[step].SS_vec[findfirst(==("liq"), out_og[step].ph)].Comp .* 100
+        else
+            og_melt_comp[:,step] = [NaN for _ in 1:11]
+        end
+        if "liq" in out_og_mp_melt[step].ph
+            og_mp_melt_comp[:,step] = out_og_mp_melt[step].SS_vec[findfirst(==("liq"), out_og_mp_melt[step].ph)].Comp .* 100
+        else
+            og_mp_melt_comp[:,step] = [NaN for _ in 1:11]
+        end
+        if "liq" in out_og_mg_melt[step].ph
+            og_mg_melt_comp[:,step] = out_og_mg_melt[step].SS_vec[findfirst(==("liq"), out_og_mg_melt[step].ph)].Comp .* 100
+        else
+            og_mg_melt_comp[:,step] = [NaN for _ in 1:11]
+        end
+    end
+
+    mp_melt_Ab_An_Or = Matrix{Float64}(undef, 3, length(T_array))
+    mg_melt_Ab_An_Or = Matrix{Float64}(undef, 3, length(T_array))
+    og_melt_Ab_An_Or = Matrix{Float64}(undef, 3, length(T_array))
+    og_mp_melt_Ab_An_Or = Matrix{Float64}(undef, 3, length(T_array))
+    og_mg_melt_Ab_An_Or = Matrix{Float64}(undef, 3, length(T_array))
+
+    function calculate_Ab_An_Or(melt_comp)
+        Ab = 2 * melt_comp[7]  # Na2O
+        An = melt_comp[3]      # CaO
+        Or = 2 * melt_comp[6]      # K2O
+        total = Ab + An + Or
+        Ab = Ab / total
+        An = An / total
+        Or = Or / total
+        return [Ab, An, Or]
+    end
+    for step in eachindex(T_array)
+        mp_melt_Ab_An_Or[:,step] = calculate_Ab_An_Or(mp_melt_comp[:, step])
+        mg_melt_Ab_An_Or[:,step] = calculate_Ab_An_Or(mg_melt_comp[:, step])
+        og_melt_Ab_An_Or[:,step] = calculate_Ab_An_Or(og_melt_comp[:, step])
+        og_mp_melt_Ab_An_Or[:,step] = calculate_Ab_An_Or(og_mp_melt_comp[:, step])
+        og_mg_melt_Ab_An_Or[:,step] = calculate_Ab_An_Or(og_mg_melt_comp[:, step])
+    end
+
+    mp_melt_Qz_Pl_Kfs = Matrix{Float64}(undef, 3, length(T_array))
+    mg_melt_Qz_Pl_Kfs = Matrix{Float64}(undef, 3, length(T_array))
+    og_melt_Qz_Pl_Kfs = Matrix{Float64}(undef, 3, length(T_array))
+    og_mp_melt_Qz_Pl_Kfs = Matrix{Float64}(undef, 3, length(T_array))
+    og_mg_melt_Qz_Pl_Kfs = Matrix{Float64}(undef, 3, length(T_array))
+
+    function calculate_Qz_Pl_Kfs(melt_comp)
+        An = melt_comp[3] # CaO
+        Ab = 2 * melt_comp[7]  # Na2O
+        Kfs = 2 * melt_comp[6]  # K2O
+        Pl = An + Ab
+        Qz = melt_comp[1]  - (3*Ab + 2*An + 3*Kfs) # SiO2
+        total = Qz + Pl + Kfs
+        Qz = Qz / total
+        Pl = Pl / total
+        Kfs = Kfs / total
+        return [Qz, Pl, Kfs]
+    end
+
+    for step in eachindex(T_array)
+        mp_melt_Qz_Pl_Kfs[:,step] = calculate_Qz_Pl_Kfs(mp_melt_comp[:, step])
+        mg_melt_Qz_Pl_Kfs[:,step] = calculate_Qz_Pl_Kfs(mg_melt_comp[:, step])
+        og_melt_Qz_Pl_Kfs[:,step] = calculate_Qz_Pl_Kfs(og_melt_comp[:, step])
+        og_mp_melt_Qz_Pl_Kfs[:,step] = calculate_Qz_Pl_Kfs(og_mp_melt_comp[:, step])
+        og_mg_melt_Qz_Pl_Kfs[:,step] = calculate_Qz_Pl_Kfs(og_mg_melt_comp[:, step])
+    end
+
+    function ternary_to_cartesian(a, b, c)
+        # a + b + c must = 1
+        x = b + 0.5c
+        y = (sqrt(3)/2) * c
+        return x, y
+    end
+
+    function ternary_plot(ax, data, color, label)
+        x = zeros(size(data, 2))
+        y = zeros(size(data, 2))
+        for i in eachindex(x)
+            # data is [Ab, An, Or], while ternary_to_cartesian expects [left, right, top] = [Ab, Or, An]
+            x[i], y[i] = ternary_to_cartesian(data[1,i], data[3,i], data[2,i])
+        end
+        valid = isfinite.(x) .& isfinite.(y)
+        xv = x[valid]
+        yv = y[valid]
+        lines!(ax, xv, yv, color=color, linewidth=2, label=label)
+    end
+
+    figure = Figure()
+    ax1 = Axis(figure[1, 1], xlabel = "", ylabel = "", aspect = DataAspect())
+    hidedecorations!(ax1)
+    hidespines!(ax1)
+    # Triangle vertices
+    Ab = (0.0, 0.0)
+    Or = (1.0, 0.0)
+    An = (0.5, sqrt(3)/2)
+
+    # Draw triangle
+    lines!(ax1, [Ab[1], Or[1]], [Ab[2], Or[2]], color=:black)
+    lines!(ax1, [Or[1], An[1]], [Or[2], An[2]], color=:black)
+    lines!(ax1, [An[1], Ab[1]], [An[2], Ab[2]], color=:black)
+    xlims!(ax1, -0.2, 1.2)
+    ylims!(ax1, -0.2, sqrt(3)/2 + 0.2)
+
+    text!(ax1, Ab[1]-0.01, Ab[2]-0.01, text="Ab", align=(:right, :top))
+    text!(ax1, An[1], An[2]+0.01, text="An", align=(:center, :bottom))
+    text!(ax1, Or[1]+0.01, Or[2]-0.01, text="Or", align=(:left, :top))
+
+    ternary_plot(ax1, mp_melt_Ab_An_Or, :black, "MP melt")
+    ternary_plot(ax1, mg_melt_Ab_An_Or, :gray, "MG melt")
+    ternary_plot(ax1, og_melt_Ab_An_Or, :pink, "OG melt")
+    ternary_plot(ax1, og_mp_melt_Ab_An_Or, :purple, "OG+MP melt")
+    ternary_plot(ax1, og_mg_melt_Ab_An_Or, :red, "OG+MG melt")
+
+    ax2 = Axis(figure[1, 2], xlabel = "", ylabel = "", aspect = DataAspect())
+    hidedecorations!(ax2)
+    hidespines!(ax2)
+    # Triangle vertices
+    Pl = (0.0, 0.0)
+    Kfs = (1.0, 0.0)
+    Qz = (0.5, sqrt(3)/2)
+
+    # Draw triangle
+    lines!(ax2, [Pl[1], Kfs[1]], [Pl[2], Kfs[2]], color=:black)
+    lines!(ax2, [Kfs[1], Qz[1]], [Kfs[2], Qz[2]], color=:black)
+    lines!(ax2, [Qz[1], Pl[1]], [Qz[2], Pl[2]], color=:black)
+    xlims!(ax2, -0.2, 1.2)
+    ylims!(ax2, -0.2, sqrt(3)/2 + 0.2)
+
+    text!(ax2, Pl[1]-0.01, Pl[2]-0.01, text="Pl", align=(:right, :top))
+    text!(ax2, Kfs[1]+0.01, Kfs[2]-0.01, text="Kfs", align=(:left, :top))
+    text!(ax2, Qz[1], Qz[2]+0.01, text="Qz", align=(:center, :bottom))
+
+    ternary_plot(ax2, mp_melt_Qz_Pl_Kfs, :black, "MP melt")
+    ternary_plot(ax2, mg_melt_Qz_Pl_Kfs, :gray, "MG melt")
+    ternary_plot(ax2, og_melt_Qz_Pl_Kfs, :pink, "OG melt")
+    ternary_plot(ax2, og_mp_melt_Qz_Pl_Kfs, :purple, "OG+MP melt")
+    ternary_plot(ax2, og_mg_melt_Qz_Pl_Kfs, :red, "OG+MG melt")
+    axislegend(ax2)
+    return figure
 end
 
 end # module

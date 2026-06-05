@@ -110,7 +110,7 @@ end
 T_og_mp = T_array[idx_mp_exceeds] - T_solidus_og
 T_og_mg = T_array[idx_mg_exceeds] - T_solidus_og
 
-# Print results
+# # Print results
 println("H2O released mp: $(H2O_released_mp[1]*100) mol%, $(H2O_released_mp[2]*100) vol%, $(H2O_released_mp[3]*100) wt%")
 println("H2O released mg: $(H2O_released_mg[1]*100) mol%, $(H2O_released_mg[2]*100) vol%, $(H2O_released_mg[3]*100) wt%")
 println("$T_solidus_mp °C metapelite solidus temperature")
@@ -123,6 +123,11 @@ println("melt_fraction_og_mg = $(melt_frac_og_mg[idx_mg_exceeds,3]*100)")
 println("melt_fraction_og_mp at T_solidus_mp = $(melt_frac_og_mp[Int(T_solidus_mp-Tmin+1),3]*100) %")
 println("melt_fraction_og_mg at T_solidus_mg = $(melt_frac_og_mg[Int(T_solidus_mg-Tmin+1),3]*100) %")
 
+println("mp melt composition at T_solidus_mp: $(out_mp[Int(T_solidus_mp-Tmin+1)].SS_vec[findfirst(==("liq"), out_mp[Int(T_solidus_mp-Tmin+1)].ph)].Comp_wt)")
+println("mg melt composition at T_solidus_mg: $(out_mg[Int(T_solidus_mg-Tmin+1)].SS_vec[findfirst(==("liq"), out_mg[Int(T_solidus_mg-Tmin+1)].ph)].Comp_wt)")
+println("og melt composition at T_solidus_og: $(out_og[Int(T_solidus_og-Tmin+1)].SS_vec[findfirst(==("liq"), out_og[Int(T_solidus_og-Tmin+1)].ph)].Comp_wt)")
+println("og+mp melt composition at T_solidus_og: $(out_og_mp_melt[Int(T_solidus_mp-Tmin+1)].SS_vec[findfirst(==("liq"), out_og_mp_melt[Int(T_solidus_mp-Tmin+1)].ph)].Comp_wt)")
+println("og+mg melt composition at T_solidus_og: $(out_og_mg_melt[Int(T_solidus_mg-Tmin+1)].SS_vec[findfirst(==("liq"), out_og_mg_melt[Int(T_solidus_mg-Tmin+1)].ph)].Comp_wt)")
 
 """
 Plot the results
@@ -139,8 +144,10 @@ fig_melt_comp = plot_fig_melt_comp(T_array, out_mp, out_mg, out_og, out_og_mp_me
 fig1 = plot_fig1(T_array, H2O_frac_mp_total_cum, H2O_frac_mg_total_cum, T_solidus_mp, T_solidus_mg, T_solidus_og, H2O_released_mp, H2O_released_mg)
 fig2 = plot_fig2(T_array, melt_frac_og_mp[:,3], melt_frac_og_mg[:,3], melt_frac_mp[:,3], melt_frac_mg[:,3], melt_frac_og[:,3], T_solidus_mp, T_solidus_mg, T_solidus_og)
 fig3 = plot_fig3(T_array, out_mp, out_mg, out_og, out_og_mp_melt, out_og_mg_melt, effect_frac_mp_total, effect_frac_mg_total, effect_frac_og_mp_melt_total, effect_frac_og_mg_melt_total, g_frac_mp_total_cum, g_frac_mg_total_cum, g_frac_og_total_cum, H2O_frac_mp_total_cum, H2O_frac_mg_total_cum, H2O_frac_og_total_cum, melt_frac_mp, melt_frac_mg, melt_frac_og, T_solidus_mp, T_solidus_mg, T_solidus_og, g_frac_og_mp_melt_total_cum, g_frac_og_mg_melt_total_cum, H2O_frac_og_mp_melt_total_cum, H2O_frac_og_mg_melt_total_cum, melt_frac_og_mp, melt_frac_og_mg)
+fig_ternary = plot_ternary_diagrams(T_array, out_mp, out_mg, out_og, out_og_mp_melt, out_og_mg_melt)
 save("H2O_frac_PT.svg", fig1)
 save("An_fraction_PT.svg", fig_pl)
 save("Melt_comp_PT.svg", fig_melt_comp)
 save("Liq_frac_PT.svg",  fig2)
-save("Mode_Boxes_4Panel_PT.svg", fig3)
+save("Mode_Boxes_PT.svg", fig3)
+save("Ternary_diagrams_PT.svg", fig_ternary)
